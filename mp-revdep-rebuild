@@ -5,6 +5,7 @@
 # Original Author: Stanislav Brabec
 # Rewrite Author: Michael A. Smith
 # Current Maintainer: Paul Varner <fuzzyray@gentoo.org>
+# Port to MacPorts: Thomas de Grivel <billitch@gmail.com>
 
 # TODO:
 # - Use more /etc/init.d/functions.sh
@@ -23,14 +24,14 @@ declare -r     ENV_FILE=0_env.rr     # Contains environment variables
 declare -r   FILES_FILE=1_files.rr   # Contains a list of files to search
 declare -r  LDPATH_FILE=2_ldpath.rr  # Contains the LDPATH
 declare -r  BROKEN_FILE=3_broken.rr  # Contains the list of broken files
-declare -r  ERRORS_FILE=3_errors.rr  # Contains the ldd error output
+declare -r  ERRORS_FILE=3_errors.rr  # Contains the otool error output
 declare -r     RAW_FILE=4_raw.rr     # Contains the raw list of packages
 declare -r  OWNERS_FILE=4_owners.rr  # Contains the file owners
 declare -r    PKGS_FILE=4_pkgs.rr    # Contains the unsorted bare package names
-declare -r EBUILDS_FILE=4_ebuilds.rr # Contains the unsorted atoms
+declare -r   PORTS_FILE=4_ports.rr   # Contains the unsorted atoms
                                      # (Appropriately slotted or versioned)
 declare -r   ORDER_FILE=5_order.rr   # Contains the sorted atoms
-declare -r  STATUS_FILE=6_status.rr  # Contains the ldd error output
+declare -r  STATUS_FILE=6_status.rr  # Contains the otool error output
 declare -ra FILES=(
 	"$ENV_FILE"
 	"$FILES_FILE"
@@ -40,7 +41,7 @@ declare -ra FILES=(
 	"$RAW_FILE"
 	"$OWNERS_FILE"
 	"$PKGS_FILE"
-	"$EBUILDS_FILE"
+	"$PORTS_FILE"
 	"$ORDER_FILE"
 	"$STATUS_FILE"
 )
@@ -50,16 +51,16 @@ declare -ra FILES=(
 declare FULL_LD_PATH           # ...search across the COMPLETE_LD_LIBRARY_PATH
 declare KEEP_TEMP              # ...not delete tempfiles from the current run
 declare ORDER_PKGS             # ...sort the atoms in deep dependency order
-declare PACKAGE_NAMES          # ...emerge by slot, not by versionated atom
+declare PACKAGE_NAMES          # ...rebuild by slot, not by versionated atom
 declare RM_OLD_TEMPFILES       # ...remove tempfiles from prior runs
 declare SEARCH_BROKEN          # ...search for broken libraries and binaries
 declare VERBOSE                # ...give verbose output
 
-# Globals that impact portage directly:
-declare EMERGE_DEFAULT_OPTS    # String of options portage assumes to be set
-declare EMERGE_OPTIONS         # Array of options to pass to portage
-declare PORTAGE_NICENESS       # Renice to this value
-declare PORTAGE_ROOT           # The root path for portage
+# Globals that impact port directly:
+declare PORT_DEFAULT_OPTS      # String of options port assumes to be set
+declare PORT_OPTIONS           # Array of options to pass to port
+declare MACPORTS_NICENESS      # Renice to this value
+declare MACPORTS_ROOT          # The root path for macports
 
 # Customizable incremental variables:
 # These variables can be prepended to either by setting the variable in
@@ -75,22 +76,22 @@ declare SEARCH_DIRS_MASK # List of dirs not to search
 
 # Other globals:
 declare OLDPROG                # Previous pass through the progress meter
-declare EXACT_PKG              # Versionated atom to emerge
+declare EXACT_PKG              # Versionated atom to rebuild
 declare HEAD_TEXT              # Feedback string about the search
 declare NOCOLOR                # Set to "true" not to output term colors
 declare OK_TEXT                # Feedback about a search which found no errors
 declare RC_NOCOLOR             # Hack to insure we respect NOCOLOR
-declare REBUILD_LIST           # Array of atoms to emerge
-declare SKIP_LIST              # Array of atoms that cannot be emerged (masked?)
+declare REBUILD_LIST           # Array of atoms to rebuild
+declare SKIP_LIST              # Array of atoms that cannot be rebuilt (masked?)
 declare SONAME                 # Soname/soname path pattern given on commandline
-declare SONAME_SEARCH          # Value of SONAME modified to match ldd's output
+declare SONAME_SEARCH          # Value of SONAME modified to match otool's output
 declare WORKING_TEXT           # Feedback about the search
 declare WORKING_DIR            # Working directory where cache files are kept
 
 main() {
 	# preliminary setup
 	get_opts "$@"
-	setup_portage
+	setup_macports
 	setup_search_paths_and_masks
 	get_search_env
 	echo
@@ -163,32 +164,30 @@ EW
 
 print_usage() {
 cat << EOF
-Usage: $APP_NAME [OPTIONS] [--] [EMERGE_OPTIONS]
+Usage: $APP_NAME [OPTIONS] [--] [PORT_OPTIONS]
 
 Broken reverse dependency rebuilder.
 
   -C, --nocolor        Turn off colored output
   -d, --debug          Print way too much information (uses bash's set -xv)
-  -e, --exact          Emerge based on exact package version
+  -e, --exact          Rebuild exact package version
   -h, --help           Print this usage
   -i, --ignore         Ignore temporary files from previous runs
   -k, --keep-temp      Do not delete temporary files on exit
-  -L, --library NAME   Emerge existing packages that use the library with NAME
+  -L, --library NAME   Rebuild existing packages that use the library with NAME
       --library=NAME   NAME can be a full path to the library or a basic
                        regular expression (man grep)
   -l, --no-ld-path     Do not set LD_LIBRARY_PATH
   -o, --no-order       Do not check the build order
                        (Saves time, but may cause breakage.)
   -p, --pretend        Do a trial run without actually emerging anything
-                       (also passed to emerge command)
+                       (also passed to port command)
   -P, --no-progress    Turn off the progress meter
-  -q, --quiet          Be less verbose (also passed to emerge command)
-  -v, --verbose        Be more verbose (also passed to emerge command)
+  -q, --quiet          Be less verbose (also passed to port command)
+  -v, --verbose        Be more verbose (also passed to port command)
 
-Calls emerge, options after -- are ignored by $APP_NAME
-and passed directly to emerge.
-
-Report bugs to <http://bugs.gentoo.org>
+Calls port, options after -- are ignored by $APP_NAME
+and passed directly to port.
 EOF
 }
 ##
@@ -250,32 +249,52 @@ clean_exit() {
 	einfo "$OK_TEXT... All done. "
 	exit 0
 }
+last() {
+    local LAST
+    local WORD
+    for WORD in $@; do
+        LAST=$WORD
+    done
+    echo $LAST
+}
 ##
 # Get the name of the package that owns a file or list of files given as args.
 get_file_owner() {
-	local IFS=$'\n'
-	# ${*/%/ } adds a space to the end of each object name to prevent false
-	# matches, for example /usr/bin/dia matching /usr/bin/dialog (bug #196460).
-	find -L /var/db/pkg -name CONTENTS -print0 |
-		xargs -0 grep -Fl "${*/%/ }" |
-		sed 's:/var/db/pkg/\(.*\)/CONTENTS:\1:'
+    local F
+    local W
+    for F in $@; do
+        W=$(port provides "$F")
+        if echo $W | grep 'is not provided by' >/dev/null; then
+            false
+        else
+            last $W
+        fi
+    done
 }
 ##
-# Normalize some EMERGE_OPTIONS
-normalize_emerge_opts() {
-	# Normalize some EMERGE_OPTIONS
-	EMERGE_OPTIONS=(${EMERGE_OPTIONS[@]/%-p/--pretend})
-	EMERGE_OPTIONS=(${EMERGE_OPTIONS[@]/%-f/--fetchonly})
-	EMERGE_OPTIONS=(${EMERGE_OPTIONS[@]/%-f/--verbose})
+# Normalize some PORT_OPTIONS
+normalize_port_opts() {
+	# Normalize some PORT_OPTIONS
+    echo -n
 }
 ##
-# Use the color preference from portage
+# Define some colors
 setup_color() {
-	# This should still work if NOCOLOR is set by the -C flag or in the user's
-	# environment.
-	export NOCOLOR=$(portageq envvar NOCOLOR)
-	[[ $NOCOLOR = yes || $NOCOLOR = true ]] && export RC_NOCOLOR=yes # HACK! (grr)
-	. /etc/init.d/functions.sh
+    GOOD=$'\e[32;01m'
+    WARN=$'\e[33;01m'
+    BAD=$'\e[31;01m'
+    HILITE=$'\e[36;01m'
+    BRACKET=$'\e[34;01m'
+    NORMAL=$'\e[0m'
+}
+einfo() {
+    echo " ${GOOD}*${NORMAL} $*" >&2
+}
+ewarn() {
+    echo " ${WARN}*${NORMAL} $*" >&2
+}
+eerror() {
+    echo " ${WARN}*${NORMAL} $*" >&2
 }
 ##
 # Die if an argument is missing.
@@ -290,8 +309,8 @@ die_invalid_option() {
 	echo
 	echo  "Encountered unrecognized option $1." >&2
 	echo
-	echo  "$APP_NAME no longer automatically passes unrecognized options to portage."
-	echo  "Separate emerge-only options from revdep-rebuild options with the -- flag."
+	echo  "$APP_NAME no longer automatically passes unrecognized options to port."
+	echo  "Separate port-only options from revdep-rebuild options with the -- flag."
 	echo
 	echo  "For example, $APP_NAME -v -- --ask"
 	echo
@@ -342,16 +361,16 @@ get_longopts() {
 		                            --no-ld-path) unset FULL_LD_PATH;;
 		                              --no-order) unset ORDER_PKGS;;
 		                           --no-progress) progress() { :; };;
-		                               --pretend) EMERGE_OPTIONS+=("--pretend");;
+		                               --pretend) PORT_OPTIONS+=("--pretend");;
 		                                 --quiet) echo_v() { :; }
 		                                          progress() { :; }
 		                                          quiet=1
-		                                          EMERGE_OPTIONS+=($1);;
+		                                          PORT_OPTIONS+=($1);;
 		                               --verbose) VERBOSE=1
-		                                          EMERGE_OPTIONS+=("--verbose");;
+		                                          PORT_OPTIONS+=("--verbose");;
 		                         --extra-verbose) warn_deprecated_opt "$1" "--verbose"
 		                                          VERBOSE=1
-		                                          EMERGE_OPTIONS+=("--verbose");;
+		                                          PORT_OPTIONS+=("--verbose");;
 		                         --package-names) # No longer used, since it is the
 		                                          # default. We accept it for
 		                                          # backwards compatibility.
@@ -381,13 +400,13 @@ get_shortopts() {
 			l) unset FULL_LD_PATH;;
 			o) unset ORDER_PKGS;;
 			P) progress() { :; };;
-			p) EMERGE_OPTIONS+=("--pretend");;
+			p) PORT_OPTIONS+=("--pretend");;
 			q) echo_v() { :; }
 			   progress() { :; }
 			   quiet=1
-			   EMERGE_OPTIONS+=("--quiet");;
+			   PORT_OPTIONS+=("--quiet");;
 			v) VERBOSE=1
-			   EMERGE_OPTIONS+=("--verbose");;
+			   PORT_OPTIONS+=("--verbose");;
 			X) # No longer used, since it is the default.
 			   # We accept it for backwards compatibility.
 			   warn_deprecated_opt "-X"
@@ -402,8 +421,8 @@ get_opts() {
 	local avoid_utils
 	local -a args
 	echo_v() { ewarn "$@"; }
-	unset VERBOSE KEEP_TEMP EMERGE_OPTIONS RM_OLD_TEMPFILES
-	ORDER_PKGS=1
+	unset VERBOSE KEEP_TEMP PORT_OPTIONS RM_OLD_TEMPFILES
+#	ORDER_PKGS=1
 	PACKAGE_NAMES=1
 	SONAME="not found"
 	SEARCH_BROKEN=1
@@ -411,7 +430,7 @@ get_opts() {
 	while [[ $1 ]]; do
 		case $1 in
 			--) shift
-			    EMERGE_OPTIONS+=("$@")
+			    PORT_OPTIONS+=("$@")
 			    break;;
 			-*) while true; do
 			      args+=("$1")
@@ -429,19 +448,19 @@ get_opts() {
 	done
 
 	setup_color
-	normalize_emerge_opts
+	normalize_port_opts
 
-	# If the user is not super, add --pretend to EMERGE_OPTIONS
-	if [[ ${EMERGE_OPTIONS[@]} != *--pretend* && $UID -ne 0 ]]; then
-		ewarn "You are not superuser. Adding --pretend to emerge options."
-		EMERGE_OPTIONS+=(--pretend)
+	# If the user is not super, add --pretend to PORT_OPTIONS
+	if [[ ${PORT_OPTIONS[@]} != *--pretend* && $UID -ne 0 ]]; then
+		ewarn "You are not superuser. Adding --pretend to port options."
+		PORT_OPTIONS+=(--pretend)
 	fi
 }
 ##
-# Is there a --pretend or --fetchonly flag in the EMERGE_OPTIONS array?
+# Is there a --pretend or --fetchonly flag in the PORT_OPTIONS array?
 is_real_merge() {
-	[[ ${EMERGE_OPTIONS[@]} != *--pretend* &&
-	   ${EMERGE_OPTIONS[@]} != *--fetchonly* ]]
+	[[ ${PORT_OPTIONS[@]} != *--pretend* &&
+	   ${PORT_OPTIONS[@]} != *--fetchonly* ]]
 }
 ##
 # Clean up temporary files and exit
@@ -530,10 +549,11 @@ get_search_env() {
 	local uid=$(python -c 'import os; import pwd; print pwd.getpwuid(os.getuid())[0]')
 	# Find a place to put temporary files
 	if [[ "$uid" == "root" ]]; then
-		local tmp_target="/var/cache/${APP_NAME}"
+		local tmp_target="/private/var/cache/${APP_NAME}"
 	else
-		local tmp_target="$(mktemp -d -t revdep-rebuild.XXXXXXXXXX)"
+		local tmp_target="$(TMPDIR=/private/tmp mktemp -d -t revdep-rebuild.XXXXXXXXXX)"
 	fi
+        tmp_target="$(echo "$tmp_target" | tr -s /)"
 
 	# From here on all work is done inside the temporary directory
 	verify_tmpdir "$tmp_target" "$uid"
@@ -571,16 +591,12 @@ get_search_env() {
 	# Compare old and new environments
 	# Don't use our previous files if environment doesn't match
 	new_env=$(
-		# We do not care if these emerge options change
-		EMERGE_OPTIONS=(${EMERGE_OPTIONS[@]//--pretend/})
-		EMERGE_OPTIONS=(${EMERGE_OPTIONS[@]//--fetchonly/})
-		EMERGE_OPTIONS=(${EMERGE_OPTIONS[@]//--verbose/})
 		cat <<- EOF
 			SEARCH_DIRS="$SEARCH_DIRS"
 			SEARCH_DIRS_MASK="$SEARCH_DIRS_MASK"
 			LD_LIBRARY_MASK="$LD_LIBRARY_MASK"
-			PORTAGE_ROOT="$PORTAGE_ROOT"
-			EMERGE_OPTIONS="${EMERGE_OPTIONS[@]}"
+			MACPORTS_ROOT="$MACPORTS_ROOT"
+			PORT_OPTIONS="${PORT_OPTIONS[@]}"
 			ORDER_PKGS="$ORDER_PKGS"
 			FULL_LD_PATH="$FULL_LD_PATH"
 		EOF
@@ -602,7 +618,7 @@ get_search_env() {
 	else
 		for file in "${FILES[@]}"; do
 			if [ -e "$file" ]; then
-				chown ${uid}:portage "$file"
+				chown ${UID} "$file"
 				chmod 700 "$file"
 			fi
 		done
@@ -616,7 +632,7 @@ get_search_env() {
 	echo
 	einfo "Checking reverse dependencies"
 	einfo "Packages containing binaries and libraries $HEAD_TEXT"
-	einfo "will be emerged."
+	einfo "will be rebuilt."
 }
 
 get_files() {
@@ -655,7 +671,6 @@ get_ldpath() {
 		COMPLETE_LD_LIBRARY_PATH=(
 			/lib*
 			/usr/lib*
-			$(sed '/^#/d;s/#.*$//' < /etc/ld.so.conf)
 			$(sed 's:/[^/]*$::' < "$FILES_FILE" | sort -ru)
 		)
 		IFS=':'
@@ -669,8 +684,8 @@ main_checks() {
 	local target_file
 	local -a files
 	local i=0
-	local ldd_output
-	local ldd_status
+	local otool_output
+	local otool_status
 	local numFiles
 	local COMPLETE_LD_LIBRARY_PATH
 	if [[ $SEARCH_BROKEN && $FULL_LD_PATH ]]; then
@@ -689,19 +704,19 @@ main_checks() {
 			if [[ $target_file != *.la ]]; then
 				# Note: double checking seems to be faster than single with complete path
 				# (special add ons are rare).
-				ldd_output=$(ldd "$target_file" 2>> "$ERRORS_FILE" | sort -u)
-				ldd_status=$? # TODO: Check this for problems with sort
+				otool_output=$(otool -L "$target_file" 2>> "$ERRORS_FILE" | cut -f 2 | cut -d \  -f 1 | sort -u)
+				otool_status=$? # TODO: Check this for problems with sort
 				# HACK: if LD_LIBRARY_MASK is null or undefined grep -vF doesn't work
-				if grep -vF "${LD_LIBRARY_MASK:=$'\a'}" <<< "$ldd_output" |
+				if grep -vF "${LD_LIBRARY_MASK:=$'\a'}" <<< "$otool_output" |
 					grep -q "$SONAME_SEARCH"; then
 					if [[ $SEARCH_BROKEN && $FULL_LD_PATH ]]; then
-						if LD_LIBRARY_PATH="$COMPLETE_LD_LIBRARY_PATH" ldd "$target_file" 2>/dev/null |
+						if LD_LIBRARY_PATH="$COMPLETE_LD_LIBRARY_PATH" otool "$target_file" 2>/dev/null |
 							grep -vF "$LD_LIBRARY_MASK" | grep -q "$SONAME_SEARCH"; then
 							# FIXME: I hate duplicating code
 							# Only build missing direct dependencies
 							MISSING_LIBS=$(
 								expr='s/[[:space:]]*\([^[:space:]]*\) => not found/\1/p'
-								sed -n "$expr" <<< "$ldd_output"
+								sed -n "$expr" <<< "$otool_output"
 							)
 							REQUIRED_LIBS=$(
 								expr='s/^[[:space:]]*NEEDED[[:space:]]*\([^[:space:]]*\).*/\1/p';
@@ -718,7 +733,7 @@ main_checks() {
 						# Only rebuild for direct dependencies
 						MISSING_LIBS=$(
 							expr="/$SONAME_SEARCH/s/^[[:space:]]*\([^[:space:]]*\).*$/\1/p"
-							sort -u <<< "$ldd_output" | sed -n "$expr"
+							sort -u <<< "$otool_output" | sed -n "$expr"
 						)
 						REQUIRED_LIBS=$(
 							expr='s/^[[:space:]]*NEEDED[[:space:]]*\([^[:space:]]*\).*/\1/p';
@@ -826,36 +841,18 @@ clean_packages() {
 	fi
 }
 assign_packages_to_ebuilds() {
-	local EXACT_PKG
-	local PKG
-	local SLOT
-	einfo 'Assigning packages to ebuilds'
-	if [[ -r "$EBUILDS_FILE" && -s "$EBUILDS_FILE" ]]; then
-		einfo "Found existing $EBUILDS_FILE"
-	elif [[ -r "$PKGS_FILE" && -s "$PKGS_FILE" ]]; then
-			clean_trap "$EBUILDS_FILE"
-			while read EXACT_PKG; do
-				# Get the slot
-				PKG="${EXACT_PKG%%-r[[:digit:]]*}"
-				PKG="${PKG%-*}"
-				SLOT=$(</var/db/pkg/$EXACT_PKG/SLOT)
-				echo "$PKG:$SLOT"
-			done < "$PKGS_FILE" > "$EBUILDS_FILE"
-			einfo "Generated new $EBUILDS_FILE"
-	else
-		einfo 'Nothing to rebuild.'
-		die 1 '(The program should have already quit, so this is a minor bug.)'
-	fi
+    cp "$PKGS_FILE" "$PORTS_FILE"
+    einfo "Generated new $PORTS_FILE"
 }
 get_exact_ebuilds() {
 	einfo 'Assigning files to ebuilds'
-	if [[ -r $EBUILDS_FILE && -s $EBUILDS_FILE ]]; then
-		einfo "Found existing $EBUILDS_FILE"
+	if [[ -r $PORTS_FILE && -s $PORTS_FILE ]]; then
+		einfo "Found existing $PORTS_FILE"
 	elif [[ -r $BROKEN_FILE && -s $BROKEN_FILE ]]; then
 		rebuildList=" $(<"$BROKEN_FILE") "
 		rebuildList=(${rebuildList//[[:space:]]obj[[:space:]]/ })
-		get_file_owner "${rebuildList[@]}" | sed 's/^/=/' > "$EBUILDS_FILE"
-		einfo "Generated new $EBUILDS_FILE"
+		get_file_owner "${rebuildList[@]}" | sed 's/^/=/' > "$PORTS_FILE"
+		einfo "Generated new $PORTS_FILE"
 	else
 		einfo 'Nothing to rebuild.'
 		die 1 '(The program should have already quit, so this is a minor bug.)'
@@ -863,15 +860,15 @@ get_exact_ebuilds() {
 }
 list_skipped_packages() {
 	ewarn
-	ewarn 'Portage could not find any version of the following packages it could build:'
+	ewarn 'port could not find any version of the following packages it could build:'
 	ewarn "${SKIP_LIST[@]}"
 	ewarn
-	ewarn '(Perhaps they are masked, blocked, or removed from portage.)'
-	ewarn 'Try to emerge them manually.'
+	ewarn '(Perhaps they are masked, blocked, or removed from MacPorts.)'
+	ewarn 'Try to rebuild them manually.'
 	ewarn
 }
 get_build_order() {
-	local -r OLD_EMERGE_DEFAULT_OPTS="$EMERGE_DEFAULT_OPTS"
+	local -r OLD_PORT_DEFAULT_OPTS="$PORT_DEFAULT_OPTS"
 	local RAW_REBUILD_LIST
 	local REBUILD_GREP
 	local i
@@ -884,16 +881,16 @@ get_build_order() {
 		einfo "Found existing $ORDER_FILE"
 	else
 		clean_trap "$ORDER_FILE"
-		RAW_REBUILD_LIST=$(<"$EBUILDS_FILE")
+		RAW_REBUILD_LIST=$(<"$PORTS_FILE")
 		if [[ $RAW_REBUILD_LIST ]]; then
-			export EMERGE_DEFAULT_OPTS="--nospinner --pretend --oneshot --quiet"
+			export PORT_DEFAULT_OPTS="--nospinner --pretend --oneshot --quiet"
 			RAW_REBUILD_LIST=($RAW_REBUILD_LIST) # convert into array
 			# If PACKAGE_NAMES is defined we're using slots, not versions
 			if [[ $PACKAGE_NAMES ]]; then
 				# Eliminate atoms that can't be built
 				for i in "${!RAW_REBUILD_LIST[@]}"; do
 					if [[ "${RAW_REBUILD_LIST[i]}" = *[A-Za-z]* ]]; then
-						portageq best_visible "$PORTAGE_ROOT" "${RAW_REBUILD_LIST[i]}" >/dev/null && continue
+						[[ -n "$(port list "${RAW_REBUILD_LIST[i]}")" ]] && continue
 						SKIP_LIST+=("${RAW_REBUILD_LIST[i]}")
 					fi
 					unset RAW_REBUILD_LIST[i]
@@ -906,33 +903,26 @@ get_build_order() {
 					else
 						list_skipped_packages
 					fi
-					die 1 'Warning: Portage cannot rebuild any of the necessary packages.'
+					die 1 'Warning: port cannot rebuild any of the necessary packages.'
 				fi
 			fi
 			RAW_REBUILD_LIST="${RAW_REBUILD_LIST[@]}"
-			REBUILD_GREP=$(emerge --nodeps $RAW_REBUILD_LIST | sed 's/\[[^]]*\]//g')
+			REBUILD_GREP=$(port -n $RAW_REBUILD_LIST | sed 's/\[[^]]*\]//g')
 			if (( ${PIPESTATUS[0]} == 0 )); then
-				emerge --deep $RAW_REBUILD_LIST |
-					sed 's/\[[^]]*\]//g' |
+				port -d $RAW_REBUILD_LIST |
 					grep -F "$REBUILD_GREP" > "$ORDER_FILE"
 			fi
 
-			# Here we use the PIPESTATUS from the second emerge, the --deep one.
+			# Here we use the PIPESTATUS from the second port, the --deep one.
 			if (( ${PIPESTATUS[0]} != 0 )); then
 					eerror
 					eerror 'Warning: Failed to resolve package order.'
-					eerror 'Will merge in arbitrary order'
+					eerror 'Will build in arbitrary order'
 					eerror
-					cat <<- EOF
-						Possible reasons:
-						- An ebuild is no longer in the portage tree.
-						- An ebuild is masked, use /etc/portage/packages.keyword
-							and/or /etc/portage/package.unmask to unmask it
-					EOF
 					countdown 5
 					rm -f "$ORDER_FILE"
 			fi
-			export EMERGE_DEFAULT_OPTS="$OLD_EMERGE_DEFAULT_OPTS"
+			export PORT_DEFAULT_OPTS="$OLD_PORT_DEFAULT_OPTS"
 		else
 			einfo 'Nothing to rebuild.'
 			die 1 '(The program should have already quit, so this is a minor bug.)'
@@ -951,20 +941,9 @@ show_unowned_files() {
 	fi
 }
 ##
-# Setup portage and the search paths
-setup_portage() {
-	local PORTAGE_NICENESS=$(portageq envvar PORTAGE_NICENESS)
-	PORTAGE_ROOT=$(portageq envvar ROOT)
-
-	# Obey PORTAGE_NICENESS
-	if [[ $PORTAGE_NICENESS ]]; then
-		renice $PORTAGE_NICENESS $$ > /dev/null
-		# Since we have already set our nice value for our processes,
-		# reset PORTAGE_NICENESS to zero to avoid having emerge renice again.
-		export PORTAGE_NICENESS="0"
-	fi
-
-	PORTAGE_ROOT="${PORTAGE_ROOT:-/}"
+# Setup macport and the search paths
+setup_macports() {
+	MACPORTS_ROOT="${MACPORTS_ROOT:-/opt/local/}"
 }
 
 ##
@@ -974,38 +953,9 @@ setup_search_paths_and_masks() {
 
 	einfo "Configuring search environment for $APP_NAME"
 
-	# Update the incremental variables using /etc/profile.env, /etc/ld.so.conf,
-	# portage, and the environment
-
-	# Read the incremental variables from environment and portage
-	# Until such time as portage supports these variables as incrementals
-	# The value will be what is in /etc/make.conf
-	SEARCH_DIRS+=" "$(unset SEARCH_DIRS; portageq envvar SEARCH_DIRS)
-	SEARCH_DIRS_MASK+=" "$(unset SEARCH_DIRS_MASK; portageq envvar SEARCH_DIRS_MASK)
-	LD_LIBRARY_MASK+=" "$(unset LD_LIBRARY_MASK; portageq envvar LD_LIBRARY_MASK)
-
-	# Add the defaults
-	if [[ -d /etc/revdep-rebuild ]]; then
-		for configfile in /etc/revdep-rebuild/*; do
-			SEARCH_DIRS+=" "$(. $configfile; echo $SEARCH_DIRS)
-			SEARCH_DIRS_MASK+=" "$(. $configfile; echo $SEARCH_DIRS_MASK)
-			LD_LIBRARY_MASK+=" "$(. $configfile; echo $LD_LIBRARY_MASK)
-		done
-	else
-		SEARCH_DIRS+=" /bin /sbin /usr/bin /usr/sbin /lib* /usr/lib*"
-		SEARCH_DIRS_MASK+=" /opt/OpenOffice /usr/lib/openoffice"
-		LD_LIBRARY_MASK+=" libodbcinst.so libodbc.so libjava.so libjvm.so"
-	fi
-
-	# Get the ROOTPATH and PATH from /etc/profile.env
-	if [[ -r "/etc/profile.env" && -s "/etc/profile.env" ]]; then
-		SEARCH_DIRS+=" "$(. /etc/profile.env; /usr/bin/tr ':' ' ' <<< "$ROOTPATH $PATH")
-	fi
-
-	# Get the directories from /etc/ld.so.conf
-	if [[ -r /etc/ld.so.conf && -s /etc/ld.so.conf ]]; then
-		SEARCH_DIRS+=" "$(sed '/^#/d;s/#.*$//' /etc/ld.so.conf)
-	fi
+	SEARCH_DIRS=" /opt/local/bin /opt/local/sbin /opt/local/lib* /opt/local/usr/lib*"
+	SEARCH_DIRS_MASK=" /opt/local/lib/OpenOffice"
+	LD_LIBRARY_MASK=" libodbcinst.so libodbc.so libjava.so libjvm.so"
 
 	# Set the final variables
 	SEARCH_DIRS=$(clean_var <<< "$SEARCH_DIRS")
@@ -1029,13 +979,13 @@ rebuild() {
 		REBUILD_LIST=( $(<"$LIST.5_order") )
 		REBUILD_LIST="${REBUILD_LIST[@]/#/=}"
 	else
-		REBUILD_LIST=$(sort -u "$EBUILDS_FILE")
+		REBUILD_LIST=$(sort -u "$PORTS_FILE")
 	fi
 
 	trap - SIGHUP SIGINT SIGQUIT SIGABRT SIGTERM
 
 	einfo 'All prepared. Starting rebuild'
-	echo "emerge --oneshot ${EMERGE_OPTIONS[@]} $REBUILD_LIST"
+	echo "port upgrade -f -n ${PORT_OPTIONS[@]} $REBUILD_LIST"
 
 	is_real_merge && countdown 10
 
@@ -1044,7 +994,7 @@ rebuild() {
 
 	# Run in background to correctly handle Ctrl-C
 	{
-		EMERGE_DEFAULT_OPTS="--oneshot ${EMERGE_OPTIONS[@]}" emerge $REBUILD_LIST <&6
+		port upgrade -f -n ${PORT_OPTIONS[@]} $REBUILD_LIST <&6
 		echo $? > "$STATUS_FILE"
 	} &
 	wait
@@ -1057,20 +1007,18 @@ rebuild() {
 cleanup() {
 	if (( $(<"$STATUS_FILE") != 0 )); then
 		ewarn
-		ewarn "$APP_NAME failed to emerge all packages."
+		ewarn "$APP_NAME failed to rebuild all packages."
 		ewarn 'you have the following choices:'
-		einfo "- If emerge failed during the build, fix the problems and re-run $APP_NAME."
-		einfo '- Use /etc/portage/package.keywords to unmask a newer version of the package.'
-		einfo "  (and remove $ORDER_FILE to be evaluated again)"
-		einfo '- Modify the above emerge command and run it manually.'
-		einfo '- Compile or unmerge unsatisfied packages manually,'
+		einfo "- If port failed to build, fix the problems and re-run $APP_NAME."
+		einfo '- Modify the above port command and run it manually.'
+		einfo '- Compile or uninstall unsatisfied packages manually,'
 		einfo '  remove temporary files, and try again.'
 		einfo '  (you can edit package/ebuild list first)'
 		einfo
 		einfo 'To remove temporary files, please run:'
 		einfo "rm ${WORKING_DIR}/*.rr"
 		show_unowned_files
-		exit $EMERGE_STATUS
+		exit $PORT_STATUS
 	elif is_real_merge; then
 		trap_cmd() {
 			eerror "terminated. Please remove the temporary files manually:"
@@ -1085,7 +1033,7 @@ cleanup() {
 		einfo 'are fixed. Possible reasons for remaining inconsistencies include:'
 		einfo '  orphaned files'
 		einfo '  deep dependencies'
-		einfo "  packages installed outside of portage's control"
+		einfo "  packages installed without MacPorts"
 		einfo '  specially-evaluated libraries'
 		if [[ -r "$OWNERS_FILE" && -s "$OWNERS_FILE" ]]; then
 			show_unowned_files
